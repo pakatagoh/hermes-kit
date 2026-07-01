@@ -1,0 +1,108 @@
+name: Build and Publish Docker Image
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: # allow manual runs from the Actions tab
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ----------------------------------------------------------------
+      # The image tag IS the Hermes version (CalVer, e.g. v2026.6.19),
+      # parsed from the `ARG HERMES_VERSION` line in the Dockerfile.
+      # Unlike sg-voucher-manager (auto-incrementing patch), there is no
+      # build counter here — bumping Hermes means editing the ARG and
+      # committing, which produces a new tag.
+      #
+      # The repo is the source of truth for the version, so we read it
+      # rather than maintaining a separate VERSION_PREFIX.
+      # ----------------------------------------------------------------
+      - name: Read Hermes version from Dockerfile
+        id: ver
+        run: |
+          set -euo pipefail
+          VER=$(sed -nE 's/^ARG HERMES_VERSION=(.*)/\1/p' Dockerfile | head -1)
+          if [ -z "${VER}" ]; then
+            echo "Could not find ARG HERMES_VERSION=... in Dockerfile" >&2
+            exit 1
+          fi
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+          echo "Parsed Hermes version: ${VER}"
+
+      # Lowercase owner + repo → GHCR image path (GHCR requires lowercase).
+      - name: Compute image name
+        id: img
+        env:
+          OWNER_LC: ${{ github.repository_owner }}
+        run: |
+          OWNER=$(echo "${OWNER_LC}" | tr '[:upper:]' '[:lower:]')
+          echo "image=ghcr.io/${OWNER}/hermes-kit" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------------------
+      # Skip the build if this exact Hermes tag was already published.
+      # The tag is the Hermes version, so a re-run on an unchanged ARG
+      # would just republish an identical image. Bump the ARG to rebuild.
+      # ----------------------------------------------------------------
+      - name: Check if tag already exists
+        id: exists
+        env:
+          IMAGE: ${{ steps.img.outputs.image }}
+          TAG: ${{ steps.ver.outputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if docker buildx imagetools inspect "${IMAGE}:${TAG}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Tag ${IMAGE}:${TAG} already published — skipping build."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Tag ${IMAGE}:${TAG} not found — will build."
+          fi
+
+      - name: Log in to GHCR
+        if: steps.exists.outputs.exists == 'false'
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Set up Docker Buildx
+        if: steps.exists.outputs.exists == 'false'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        if: steps.exists.outputs.exists == 'false'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          build-args: |
+            HERMES_VERSION=${{ steps.ver.outputs.version }}
+          push: true
+          tags: |
+            ${{ steps.img.outputs.image }}:${{ steps.ver.outputs.version }}
+            ${{ steps.img.outputs.image }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ----------------------------------------------------------------
+      # Make the :latest manifest point at the freshly published version.
+      # (build-push-action already pushed :latest above, but re-stating it
+      # explicitly here guards against the "already exists" skip path
+      # leaving a stale :latest — in that case we still refresh it.)
+      # ----------------------------------------------------------------
+      - name: Refresh :latest tag
+        if: steps.exists.outputs.exists == 'true'
+        env:
+          IMAGE: ${{ steps.img.outputs.image }}
+          TAG: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Point :latest at the existing version tag using buildx imagetools.
+          docker buildx imagetools create \
+            --tag "${IMAGE}:latest" "${IMAGE}:${TAG}" || true
