@@ -4,23 +4,39 @@ Custom Docker image built on top of [Hermes Agent](https://github.com/NousResear
 configured to run in **gateway mode** and bundled with extra tools installed
 declaratively via [mise](https://mise.jdx.dev).
 
+Published to GHCR at `ghcr.io/pakatagoh/hermes-kit` and consumed by the homelab
+k3s cluster via Flux image automation.
+
 ## Versions
 
 | Component | Version |
 | --------- | ------- |
-| Hermes Agent | `v2026.6.19` (see `Dockerfile` `HERMES_VERSION` ARG) |
+| Image (this repo) | independent SemVer, e.g. `0.1.0` |
+| Hermes Agent (base image) | `v2026.6.19` (see `Dockerfile` `HERMES_VERSION` ARG) |
 | gh (GitHub CLI) | 2.95.0 (see [`mise.toml`](./mise.toml)) |
 
-The image is tagged to match the Hermes version, so build with:
+The image has its **own** SemVer tag — it does **not** track the Hermes
+version. Bumping Hermes (or any Dockerfile/mise change) is just a commit to
+`main`; the [build workflow](./.github/workflows/docker-publish.yml)
+auto-increments the patch and publishes a new tag to GHCR.
+
+## Build & publish
+
+Builds run automatically on push to `main` via GitHub Actions. The workflow:
+
+1. Reads `VERSION_PREFIX` (`0.1`) and queries GHCR for the highest existing
+   patch under that prefix, then publishes `<prefix>.<patch+1>` + `:latest`.
+2. Reads `ARG HERMES_VERSION` from the `Dockerfile` and passes it as a
+   build-arg (so the base image is pinned in one place).
+3. Prunes old image versions to stay within the GHCR storage quota.
+
+To do a manual local build (e.g. for testing before pushing):
 
 ```sh
 docker build \
   --build-arg HERMES_VERSION=v2026.6.19 \
-  -t hermes-kit:v2026.6.19 .
+  -t ghcr.io/pakatagoh/hermes-kit:dev .
 ```
-
-To upgrade Hermes, bump `HERMES_VERSION` in `Dockerfile`, the build command,
-and the `-t` tag in lockstep.
 
 ## Gateway mode
 
@@ -44,7 +60,7 @@ docker run --rm -it \
   -p 8642:8642 -p 9119:9119 \
   -v ~/.hermes:/opt/data \
   --env-file .env \
-  hermes-kit:v2026.6.19
+  ghcr.io/pakatagoh/hermes-kit:latest
 
 # background (persistent service)
 docker run -d \
@@ -53,7 +69,7 @@ docker run -d \
   -p 8642:8642 -p 9119:9119 \
   -v ~/.hermes:/opt/data \
   --env-file .env \
-  hermes-kit:v2026.6.19
+  ghcr.io/pakatagoh/hermes-kit:latest
 
 # enable the dashboard
 docker run -d \
@@ -61,7 +77,7 @@ docker run -d \
   -p 8642:8642 -p 9119:9119 \
   -v ~/.hermes:/opt/data \
   --env-file .env \
-  hermes-kit:v2026.6.19
+  ghcr.io/pakatagoh/hermes-kit:latest
 ```
 
 GitHub CLI reads `GH_TOKEN` from the environment (see [gh environment docs](https://cli.github.com/manual/gh_help_environment)).
@@ -73,7 +89,7 @@ tokens go in `.env` as well — copy `.env.example` and fill it in.
 ```yaml
 services:
   hermes:
-    image: hermes-kit:v2026.6.19
+    image: ghcr.io/pakatagoh/hermes-kit:latest
     container_name: hermes
     restart: unless-stopped
     ports:
@@ -98,7 +114,7 @@ services:
 
 ```sh
 # shell into the image without starting the gateway
-docker run --rm -it --env-file .env hermes-kit:v2026.6.19 bash
+docker run --rm -it --env-file .env ghcr.io/pakatagoh/hermes-kit:latest bash
 ```
 
 Inside the container:
@@ -118,66 +134,50 @@ gh = "2.95.0"
 jq = "latest"
 ```
 
-Rebuild the image to install the new tools.
+Committing the change triggers a rebuild that installs the new tools.
 
-## Running in k3s
+## Running in k3s (Flux image automation)
 
-This image is built to replace the official `nousresearch/hermes-agent` image
-in the hermes pod (`apps/hermes-agent/release.yaml` in the homelab repo).
-Three things make it work under k3s:
+This image replaces the official `nousresearch/hermes-agent` image in the
+hermes pod. The homelab Flux config (in the separate homelab repo) wires it
+up with standard image automation, mirroring the `sg-voucher-manager` pattern:
 
-### 1. Preserve the s6-overlay entrypoint
+- `ImageRepository` scans `ghcr.io/pakatagoh/hermes-kit` every 5m.
+- `ImagePolicy` with `semver: ">=0.0.0"` selects the highest published tag.
+- `ImageUpdateAutomation` rewrites the `$imagepolicy` markers in
+  `apps/hermes-agent/release.yaml` and commits the new tag back to Git.
+- Flux reconciles the commit → the pod rolls.
 
-The base image runs under **s6-overlay** (`/init` = `s6-svscan` is PID 1). It
-must start as **root** and must **not** override `ENTRYPOINT`/`command:` — the
-s6 tree chowns the volume and drops to the internal `hermes` user (UID 10000 →
-remapped to PUID/PGID 1000) itself. This Dockerfile only sets `CMD` (default
-`gateway run`), so the manifest's `args: [gateway, run]` are routed through
-`main-wrapper.sh` exactly as before. Do **not** add a `USER` directive.
+Because the image is public on GHCR, **no pull secret is needed** — k3s pulls
+anonymously, and the `ImageRepository` has no `secretRef`.
 
-### 2. mise tools must land on the s6 PATH
+### Why this image works under s6-overlay
 
-s6 reconstructs PATH from `/run/s6/container_environment`, so Docker's
-`ENV PATH=/opt/mise/shims:...` does not reliably reach the `hermes` process
-when it shells out to `gh`. The Dockerfile therefore symlinks every mise shim
-into `/usr/local/bin` (which is on the s6 PATH and baked into the image), so
-mise-managed tools are discoverable regardless of PATH propagation. mise
-installs are world-readable/executable, so the remapped unprivileged `hermes`
-user can run them.
+Two things in the `Dockerfile` make it behave correctly in the cluster:
 
-### 3. Get the image into k3s's containerd
+1. **The s6-overlay entrypoint is preserved.** The base image runs under
+   s6-overlay (`/init` = `s6-svscan` is PID 1). It must start as **root** and
+   must **not** override `ENTRYPOINT`/`command:` — the s6 tree chowns the
+   volume and drops to the internal `hermes` user (UID 10000 → remapped to
+   PUID/PGID 1000) itself. This `Dockerfile` only sets `CMD` (default
+   `gateway run`), so the pod's `args: [gateway, run]` are routed through
+   `main-wrapper.sh` exactly as in the base image. There is no `USER`
+   directive.
 
-k3s uses **containerd**, not dockerd — a `docker build` lives in Docker's
-image store and is invisible to k3s. Import it:
+2. **mise tools land on the s6 PATH.** s6 reconstructs PATH from
+   `/run/s6/container_environment`, so Docker's `ENV PATH=/opt/mise/shims:...`
+   does not reliably reach the `hermes` process when it shells out to `gh`.
+   The `Dockerfile` therefore symlinks every mise shim into `/usr/local/bin`
+   (which is on the s6 PATH and baked into the image), so mise-managed tools
+   are discoverable regardless of PATH propagation. mise installs are
+   world-readable/executable, so the remapped unprivileged `hermes` user can
+   run them.
 
-```sh
-docker build --build-arg HERMES_VERSION=v2026.6.19 -t hermes-kit:v2026.6.19 .
-docker save hermes-kit:v2026.6.19 | sudo k3s ctr images import -
-```
+## Upgrading Hermes
 
-### 4. Point the HelmRelease at the new image
+There is no manual lockstep — Flux automates the rollout:
 
-In `apps/hermes-agent/release.yaml`, change only the image reference and keep
-`pullPolicy: IfNotPresent` so k3s uses the locally-imported image instead of
-trying to pull from a registry:
-
-```yaml
-image:
-  repository: hermes-kit            # was: nousresearch/hermes-agent
-  tag: v2026.6.19                   # matches HERMES_VERSION + build tag
-  pullPolicy: IfNotPresent          # keep — local image, no registry
-```
-
-Nothing else in the release needs to change — `args`, `env` (`API_SERVER_*`,
-`PUID`/`PGID`), probes (`/health` on 8642), the Service port, and the
-`/opt/data` hostPath all work as-is because this image is built `FROM` the
-same pinned Hermes version.
-
-### Upgrading Hermes
-
-Because the image is local (not in a registry Flux can scan), there is no
-GitOps image automation — bumps are manual and must stay in lockstep:
-
-1. Bump `HERMES_VERSION` in `Dockerfile`.
-2. Rebuild + re-import into containerd with the matching `-t` tag.
-3. Bump `image.tag` in `apps/hermes-agent/release.yaml`.
+1. Bump `ARG HERMES_VERSION=` in the `Dockerfile` and commit to `main`.
+2. The workflow builds the new base and publishes the next patch tag (e.g.
+   `0.1.4`) to GHCR.
+3. Flux's `ImagePolicy` picks it up and updates the homelab repo automatically.

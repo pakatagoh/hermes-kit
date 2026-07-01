@@ -17,17 +17,57 @@ jobs:
         uses: actions/checkout@v4
 
       # ----------------------------------------------------------------
-      # The image tag IS the Hermes version (CalVer, e.g. v2026.6.19),
-      # parsed from the `ARG HERMES_VERSION` line in the Dockerfile.
-      # Unlike sg-voucher-manager (auto-incrementing patch), there is no
-      # build counter here — bumping Hermes means editing the ARG and
-      # committing, which produces a new tag.
-      #
-      # The repo is the source of truth for the version, so we read it
-      # rather than maintaining a separate VERSION_PREFIX.
+      # The image has its OWN SemVer tag, independent of the Hermes
+      # version it wraps. Bumping Hermes (or any Dockerfile/mise change)
+      # is just a commit to main → this workflow runs → patch +1 → Flux
+      # picks up the new tag. MAJOR.MINOR is fixed via VERSION_PREFIX;
+      # bump it manually (0.2, 1.0, …) for a minor/major release, which
+      # resets the patch counter.
       # ----------------------------------------------------------------
+      - name: Compute version tag
+        id: version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION_PREFIX: "0.1" # bump to 0.2 / 1.0 for a minor/major release
+        run: |
+          set -euo pipefail
+          PREFIX="${VERSION_PREFIX}"
+          echo "Version prefix (major.minor): ${PREFIX}"
+
+          # Lowercase owner → package name on GHCR
+          OWNER_LC=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          PACKAGE="hermes-kit"
+          IMAGE_NAME="ghcr.io/${OWNER_LC}/${PACKAGE}"
+          echo "image=${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+
+          # Fetch all tags currently published for this package.
+          # First run → package doesn't exist yet → empty result.
+          EXISTING_TAGS=$(gh api --paginate \
+              "/user/packages/container/${PACKAGE}/versions" \
+              --jq '.[].metadata.container.tags[]?' 2>/dev/null || true)
+
+          # Find the highest PATCH among tags matching <PREFIX>.<PATCH>.
+          # Start at -1 so the first build of a prefix yields .0 (e.g. 0.1.0).
+          MAX_PATCH=-1
+          if [[ -n "${EXISTING_TAGS}" ]]; then
+            while IFS= read -r tag; do
+              [[ -z "${tag}" ]] && continue
+              if [[ "${tag}" =~ ^${PREFIX}\.([0-9]+)$ ]]; then
+                p=$((10#${BASH_REMATCH[1]}))
+                if (( p > MAX_PATCH )); then MAX_PATCH=${p}; fi
+              fi
+            done <<< "${EXISTING_TAGS}"
+          fi
+
+          NEXT_PATCH=$((MAX_PATCH + 1))
+          TAG="${PREFIX}.${NEXT_PATCH}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Computed image tag: ${TAG}  (previous patch: ${MAX_PATCH})"
+
+      # The Hermes version the image is built FROM is read from the Dockerfile
+      # ARG and passed as a build-arg. It is NOT the image tag (see above).
       - name: Read Hermes version from Dockerfile
-        id: ver
+        id: hermes
         run: |
           set -euo pipefail
           VER=$(sed -nE 's/^ARG HERMES_VERSION=(.*)/\1/p' Dockerfile | head -1)
@@ -36,73 +76,67 @@ jobs:
             exit 1
           fi
           echo "version=${VER}" >> "$GITHUB_OUTPUT"
-          echo "Parsed Hermes version: ${VER}"
-
-      # Lowercase owner + repo → GHCR image path (GHCR requires lowercase).
-      - name: Compute image name
-        id: img
-        env:
-          OWNER_LC: ${{ github.repository_owner }}
-        run: |
-          OWNER=$(echo "${OWNER_LC}" | tr '[:upper:]' '[:lower:]')
-          echo "image=ghcr.io/${OWNER}/hermes-kit" >> "$GITHUB_OUTPUT"
-
-      # ----------------------------------------------------------------
-      # Skip the build if this exact Hermes tag was already published.
-      # The tag is the Hermes version, so a re-run on an unchanged ARG
-      # would just republish an identical image. Bump the ARG to rebuild.
-      # ----------------------------------------------------------------
-      - name: Check if tag already exists
-        id: exists
-        env:
-          IMAGE: ${{ steps.img.outputs.image }}
-          TAG: ${{ steps.ver.outputs.version }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          if docker buildx imagetools inspect "${IMAGE}:${TAG}" >/dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "Tag ${IMAGE}:${TAG} already published — skipping build."
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "Tag ${IMAGE}:${TAG} not found — will build."
-          fi
+          echo "Building FROM nousresearch/hermes-agent:${VER}"
 
       - name: Log in to GHCR
-        if: steps.exists.outputs.exists == 'false'
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
       - name: Set up Docker Buildx
-        if: steps.exists.outputs.exists == 'false'
         uses: docker/setup-buildx-action@v3
 
       - name: Build and push
-        if: steps.exists.outputs.exists == 'false'
         uses: docker/build-push-action@v6
         with:
           context: .
           build-args: |
-            HERMES_VERSION=${{ steps.ver.outputs.version }}
+            HERMES_VERSION=${{ steps.hermes.outputs.version }}
           push: true
           tags: |
-            ${{ steps.img.outputs.image }}:${{ steps.ver.outputs.version }}
-            ${{ steps.img.outputs.image }}:latest
+            ${{ steps.version.outputs.image }}:${{ steps.version.outputs.tag }}
+            ${{ steps.version.outputs.image }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       # ----------------------------------------------------------------
-      # Make the :latest manifest point at the freshly published version.
-      # (build-push-action already pushed :latest above, but re-stating it
-      # explicitly here guards against the "already exists" skip path
-      # leaving a stale :latest — in that case we still refresh it.)
+      # Retention: keep only the most recent N image versions to stay
+      # under the GHCR free-tier storage quota (500 MB shared).
+      # The version currently tagged `latest` is never deleted.
       # ----------------------------------------------------------------
-      - name: Refresh :latest tag
-        if: steps.exists.outputs.exists == 'true'
+      - name: Prune old image versions
         env:
-          IMAGE: ${{ steps.img.outputs.image }}
-          TAG: ${{ steps.ver.outputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KEEP: "10"
+          PACKAGE: hermes-kit
         run: |
           set -euo pipefail
-          # Point :latest at the existing version tag using buildx imagetools.
-          docker buildx imagetools create \
-            --tag "${IMAGE}:latest" "${IMAGE}:${TAG}" || true
+
+          # List every version with its tags and creation date.
+          versions=$(gh api --paginate \
+              "/user/packages/container/${PACKAGE}/versions" \
+              --jq '[.[] | {id, created_at, tags: (.metadata.container.tags // [])}]' \
+              2>/dev/null || echo "[]")
+
+          if [[ "$versions" == "[]" ]]; then
+            echo "No versions found (first run?). Skipping prune."
+            exit 0
+          fi
+
+          # Protect the version currently carrying the `latest` tag.
+          latest_id=$(echo "$versions" | jq -r '.[] | select(.tags | index("latest")) | .id' | head -1)
+          echo "Protected (latest) version id: ${latest_id}"
+
+          # Everything older than the newest KEEP versions, excluding latest.
+          to_delete=$(echo "$versions" \
+            | jq -r --argjson keep "$KEEP" --argjson latest "$latest_id" \
+              'sort_by(.created_at) | reverse | .[$keep:] | .[] | select(.id != $latest) | .id')
+
+          if [[ -z "${to_delete}" ]]; then
+            echo "Nothing to prune (≤ ${KEEP} versions)."
+            exit 0
+          fi
+
+          for id in $to_delete; do
+            echo "Deleting version ${id}..."
+            gh api -X DELETE "/user/packages/container/${PACKAGE}/versions/${id}"
+          done
+          echo "Prune complete."
