@@ -14,6 +14,7 @@ k3s cluster via Flux image automation.
 | Image (this repo) | independent SemVer, e.g. `0.1.0` |
 | Hermes Agent (base image) | `v2026.6.19` (see `Dockerfile` `HERMES_VERSION` ARG) |
 | gh (GitHub CLI) | 2.95.0 (see [`mise.toml`](./mise.toml)) |
+| ctx7 (Upstash Context7 CLI) | latest (npm: [`ctx7`](https://www.npmjs.com/package/ctx7)) |
 
 The image has its **own** SemVer tag — it does **not** track the Hermes
 version. Bumping Hermes (or any Dockerfile/mise change) is just a commit to
@@ -132,6 +133,9 @@ Append to `[tools]` in `mise.toml`, e.g.:
 [tools]
 gh = "2.95.0"
 jq = "latest"
+
+# npm-based tools use the "npm:" backend prefix
+"npm:ctx7" = "latest"
 ```
 
 Committing the change triggers a rebuild that installs the new tools.
