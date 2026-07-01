@@ -38,13 +38,6 @@ RUN set -e; \
       ln -sf "$shim" "/usr/local/bin/$(basename "$shim")"; \
     done
 
-# --- GitHub CLI env -----------------------------------------------------------
-# `gh` reads GH_TOKEN by default. These are empty at build time and expected
-# to be provided at runtime via -e / --env-file.
-ENV GH_TOKEN="" \
-    GH_HOST="" \
-    GH_ENTERPRISE_TOKEN=""
-
 # Smoke check: ensure mise-managed gh is on PATH
 RUN gh --version
 
