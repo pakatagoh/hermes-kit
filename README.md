@@ -18,14 +18,14 @@ k3s cluster via Flux image automation.
 The image has its **own** SemVer tag — it does **not** track the Hermes
 version. Bumping Hermes (or any Dockerfile/mise change) is just a commit to
 `main`; the [build workflow](./.github/workflows/docker-publish.yml)
-auto-increments the patch and publishes a new tag to GHCR.
+publishes a new uniquely-tagged image to GHCR on every commit.
 
 ## Build & publish
 
 Builds run automatically on push to `main` via GitHub Actions. The workflow:
 
-1. Reads `VERSION_PREFIX` (`0.1`) and queries GHCR for the highest existing
-   patch under that prefix, then publishes `<prefix>.<patch+1>` + `:latest`.
+1. Tags the image `<epoch-millis>-<short-sha>` (e.g. `1735689600123-abc1234`)
+   — one tag per build, millisecond-grained and monotonic, with no `latest`.
 2. Reads `ARG HERMES_VERSION` from the `Dockerfile` and passes it as a
    build-arg (so the base image is pinned in one place).
 3. Prunes old image versions to stay within the GHCR storage quota.
